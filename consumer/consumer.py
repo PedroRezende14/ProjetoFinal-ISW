@@ -6,9 +6,66 @@ from datetime import datetime
 import logging
 import threading
 import time
+import requests
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+class TelegramBot:
+    def __init__(self):
+        self.TOKEN = "7711281355:AAEKBV2SuLGLSOf5B3IV44D_U6iTMnpZc8E"
+        self.CHAT_ID = "5884385833"
+        self.BOT_URL = f"https://api.telegram.org/bot{self.TOKEN}/sendMessage"
+        self.bot_ativo = False
+        self._test_connection()
+    
+    def _test_connection(self):
+        """Testa a conexão com o bot do Telegram"""
+        try:
+            test_url = f"https://api.telegram.org/bot{self.TOKEN}/getMe"
+            test_response = requests.get(test_url, timeout=5)
+            test_result = test_response.json()
+            
+            if test_result.get('ok'):
+                bot_name = test_result['result']['first_name']
+                logger.info(f"✅ Bot Telegram conectado: {bot_name}")
+                self.bot_ativo = True
+            else:
+                logger.error(f"❌ Erro na conexão do bot: {test_result}")
+                self.bot_ativo = False
+                
+        except Exception as e:
+            logger.error(f"❌ Erro de conexão com Telegram: {e}")
+            self.bot_ativo = False
+    
+    def enviar_mensagem(self, texto):
+        """Envia uma mensagem para o Telegram"""
+        if not self.bot_ativo:
+            logger.warning("Bot Telegram não está ativo. Tentando reconectar...")
+            self._test_connection()
+            if not self.bot_ativo:
+                return False
+        
+        dados = {
+            'chat_id': self.CHAT_ID,
+            'text': texto
+        }
+        
+        try:
+            response = requests.post(self.BOT_URL, json=dados, timeout=10)
+            resultado = response.json()
+            
+            if resultado.get('ok'):
+                logger.info("✅ Mensagem enviada para Telegram!")
+                return True
+            else:
+                logger.error(f"❌ Erro ao enviar mensagem para Telegram: {resultado}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Erro de conexão com Telegram: {e}")
+            return False
 
 
 class DatabaseManager:
@@ -62,7 +119,6 @@ class DatabaseManager:
         pg_status = self.test_postgresql_connection()
         mongo_status = self.test_mongodb_connection()
         
-        # Log apenas quando há mudança de status
         if pg_status != self.pg_status:
             if pg_status:
                 logger.info("PostgreSQL voltou a ficar online")
@@ -199,9 +255,6 @@ class DatabaseHealthChecker:
                 
                 time.sleep(1)
                 
-            except Exception as e:
-                logger.error(f"Erro no monitoramento de bancos: {e}")
-                time.sleep(1)
             except Exception as e:
                 logger.error(f"Erro no monitoramento de bancos: {e}")
                 time.sleep(1)
@@ -353,25 +406,31 @@ def validar_dados(dados):
     return True
 
 
+# Instâncias globais
 db_manager = DatabaseManager()
+telegram_bot = TelegramBot()
 
 
 def processar_callback(consumer, ch, method, properties, body):
-    """Callback principal que processa as mensagens recebidas"""
+    """Callback principal que processa as mensagens recebidas do RabbitMQ"""
     try:
         dados = json.loads(body)
-        logger.info(f"Dados recebidos: {dados}")
+        logger.info(f"📨 Mensagem recebida do RabbitMQ: {dados}")
 
         if not validar_dados(dados):
             logger.warning("Dados inválidos. Ignorando mensagem.")
             return
 
-        logger.info("Dados válidos. Processando...")
+        logger.info("✅ Dados válidos. Processando...")
 
+        # Insere nos bancos de dados
         pg_success = db_manager.insert_postgresql(dados)
         mongo_success = db_manager.insert_mongodb(dados)
 
+        # Prepara mensagem para o Telegram
+        status_msg = []
         if pg_success and mongo_success:
+            status_msg.append("✅ Dados inseridos com sucesso em ambos os bancos!")
             logger.info("Dados inseridos com sucesso em ambos os bancos!")
         else:
             error_msg = []
@@ -379,12 +438,35 @@ def processar_callback(consumer, ch, method, properties, body):
                 error_msg.append("PostgreSQL")
             if not mongo_success:
                 error_msg.append("MongoDB")
+            # status_msg.append(f"❌ Falha ao inserir em: {', '.join(error_msg)}")
             logger.error(f"Falha ao inserir em: {', '.join(error_msg)}")
+
+        # Monta mensagem para o Telegram
+        telegram_message = f"""
+ Nova mensagem processada!
+
+ Dados recebidos:
+• Nome: {dados.get('nome', 'N/A')}
+• Email: {dados.get('email', 'N/A')}
+• Telefone: {dados.get('telefone', 'N/A')}
+• Mensagem: {dados.get('mensagem', 'N/A')}
+• Idade: {dados.get('idade', 'N/A')}
+• Sexo: {dados.get('sexo', 'N/A')}
+
+ Status: {status_msg[0]}
+
+ Processado em: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}
+        """.strip()
+
+        # Envia para o Telegram
+        telegram_bot.enviar_mensagem(telegram_message)
 
     except json.JSONDecodeError:
         logger.error("O corpo da mensagem não é um JSON válido.")
+        telegram_bot.enviar_mensagem(" Erro: Mensagem recebida não é um JSON válido!")
     except Exception as e:
         logger.error(f"Erro ao processar mensagem: {e}")
+        telegram_bot.enviar_mensagem(f" Erro ao processar mensagem: {str(e)}")
 
 
 def main():
@@ -395,7 +477,8 @@ def main():
     should_restart = True 
     
     try:
-        logger.info("=== INICIANDO APLICAÇÃO ===")
+        logger.info("=== INICIANDO APLICAÇÃO CONSUMER RABBITMQ + TELEGRAM ===")
+        telegram_bot.enviar_mensagem(" Sistema Consumer RabbitMQ + Telegram iniciado!")
         
         while True:
             try:
@@ -412,8 +495,9 @@ def main():
                         
                         if pg_connected and mongo_connected:
                             logger.info("Conexões estabelecidas com sucesso!")
+                            telegram_bot.enviar_mensagem("🗄️ Bancos de dados conectados com sucesso!")
                             
-                        
+                            # Para instâncias anteriores
                             if health_checker:
                                 health_checker.stop_monitoring()
                             if rabbitmq_consumer:
@@ -422,21 +506,22 @@ def main():
                                 rabbitmq_consumer.stop_consuming()
                                 consumer_thread.join(timeout=2)
                             
-                       
+                            # Cria novas instâncias
                             rabbitmq_consumer = RabbitmqConsumer(processar_callback, host="rabbit")
                             
-                            
+                            # Inicia monitoramento
                             health_checker = DatabaseHealthChecker(db_manager, rabbitmq_consumer)
                             health_checker.start_monitoring()
                             
-                           
+                            # Inicia consumer
                             consumer_thread = threading.Thread(
                                 target=rabbitmq_consumer.start_consuming, 
                                 daemon=True
                             )
                             consumer_thread.start()
                             
-                            logger.info("Sistema operacional! Monitorando bancos de dados...")
+                            logger.info(" Sistema operacional! Aguardando mensagens do RabbitMQ...")
+                            telegram_bot.enviar_mensagem(" Sistema operacional! Aguardando mensagens do RabbitMQ...")
                         else:
                             should_restart = True
                             logger.warning("Falha ao conectar em um ou ambos os bancos. Tentando novamente...")
@@ -448,15 +533,18 @@ def main():
                         time.sleep(5)
                         continue
                 
-                
+                # Verifica se bancos continuam online
                 if not db_manager.check_databases_status():
                     should_restart = True
                     logger.warning("Um dos bancos caiu! Reiniciando...")
+                    telegram_bot.enviar_mensagem(" Um dos bancos caiu! Reiniciando sistema...")
                     continue
              
+                # Verifica se consumer está vivo
                 if consumer_thread and not consumer_thread.is_alive():
                     should_restart = True
                     logger.warning("Thread do consumer morreu. Reiniciando...")
+                    telegram_bot.enviar_mensagem(" Consumer RabbitMQ morreu! Reiniciando...")
                     continue
                 
                 time.sleep(1)
@@ -467,13 +555,16 @@ def main():
             except Exception as e:
                 should_restart = True
                 logger.error(f"Erro no loop principal: {e}")
+                telegram_bot.enviar_mensagem(f" Erro no sistema: {str(e)}")
                 logger.info("Tentando novamente em 5 segundos...")
                 time.sleep(5)
 
     except KeyboardInterrupt:
         logger.info("Aplicação interrompida pelo usuário")
+        telegram_bot.enviar_mensagem(" Sistema Consumer RabbitMQ + Telegram finalizado!")
     except Exception as e:
         logger.error(f"Erro crítico na aplicação: {e}")
+        telegram_bot.enviar_mensagem(f" Erro crítico: {str(e)}")
     finally:
         logger.info("Finalizando aplicação...")
         if health_checker:
@@ -484,6 +575,7 @@ def main():
             rabbitmq_consumer.stop_consuming()
             consumer_thread.join(timeout=2)
         db_manager.close_connections()
+        telegram_bot.enviar_mensagem(" Sistema finalizado!")
         logger.info("Aplicação finalizada")
         
 if __name__ == "__main__":
